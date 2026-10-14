@@ -226,7 +226,14 @@ is_partial_month = bool(
     and data_as_of.day < data_as_of.days_in_month
 )
 analog_month = month - 1 if is_partial_month and month > 1 else month
-analog_data = prepare_analog_comparison_data(data, year, month, data_as_of)
+analog_data = prepare_analog_comparison_data(
+    data,
+    year,
+    month,
+    data_as_of,
+    daily_production,
+    daily_hydrology,
+)
 if is_partial_month:
     analog_month = month
 if data_as_of is not None and data_as_of.year == year and data_as_of.month == month:
@@ -250,13 +257,11 @@ else:
 period = data[(data["year"] == year) & (data["month"] == month)].set_index("plant")
 comparison_year: int | None = None
 comparison_production_label: str | None = None
-production_difference_label: str | None = None
 comparison_production = pd.DataFrame()
 comparison_index = pd.DataFrame()
 if data_as_of is not None and data_as_of.year == year and data_as_of.month == month:
     comparison_year = year - 1
     comparison_production_label = f"Sản lượng lũy kế cùng kỳ {comparison_year}"
-    production_difference_label = f"Chênh lệch so với {comparison_year} (%)"
     comparison_production = monthly_cumulative_production(
         daily_production,
         comparison_year,
@@ -277,20 +282,12 @@ for plant in PLANTS:
         if not comparison_index.empty and plant in comparison_index.index
         else None
     )
-    production_difference = None
-    if pd.notna(current_production) and pd.notna(historical_production) and historical_production != 0:
-        production_difference = (
-            (float(current_production) - float(historical_production))
-            / abs(float(historical_production))
-            * 100
-        )
     row: dict[str, object] = {
         "Nhà máy": plant,
         production_label: current_production,
     }
-    if comparison_production_label is not None and production_difference_label is not None:
+    if comparison_production_label is not None:
         row[comparison_production_label] = historical_production
-        row[production_difference_label] = production_difference
     row[flow_label] = period.at[plant, "flow"] if plant in period.index else None
     row["Năm đồng dạng / Truy vấn"] = (
         f":material/search: {analog_year} · Xem" if analog_year else "Chưa đủ dữ liệu"
@@ -314,12 +311,9 @@ summary_column_config: dict[str, object] = {
         width="medium",
     ),
 }
-if comparison_production_label is not None and production_difference_label is not None:
+if comparison_production_label is not None:
     summary_column_config[comparison_production_label] = st.column_config.NumberColumn(
         f"{comparison_production_label} (triệu kWh)", format="%.3f", width="medium"
-    )
-    summary_column_config[production_difference_label] = st.column_config.NumberColumn(
-        production_difference_label, format="%+.2f%%", width="medium"
     )
 st.subheader(summary_title)
 st.dataframe(
@@ -331,9 +325,8 @@ st.dataframe(
 
 if comparison_year is not None and data_as_of is not None:
     st.caption(
-        f"So sánh cùng kỳ dùng tổng sản lượng từ 01–{data_as_of.day:02d}/{month:02d}/{comparison_year}. "
-        f"Chênh lệch = (sản lượng {year} − sản lượng {comparison_year}) / "
-        f"sản lượng {comparison_year} × 100%."
+        f"Sản lượng cùng kỳ {comparison_year} là tổng từ "
+        f"01–{data_as_of.day:02d}/{month:02d}/{comparison_year}."
     )
     incomplete_plants = comparison_production.loc[
         comparison_production["days"] < data_as_of.day, "plant"
@@ -350,9 +343,8 @@ with st.container(horizontal=True, horizontal_alignment="left", vertical_alignme
         st.session_state["selected_plant"] = "Tất cả"
     if is_partial_month and data_as_of is not None:
         st.caption(
-            f"Năm đồng dạng được tính từ T1–T{month}. T{month} dùng sản lượng bình quân "
-            f"ngày 1–{data_as_of.day} quy đổi cho cả tháng và lưu lượng trung bình "
-            f"1–{data_as_of.day}/{month}."
+            f"Năm đồng dạng được tính từ T1–T{month}. T{month} so sánh cùng kỳ "
+            f"01–{data_as_of.day:02d}/{month:02d}: sản lượng lũy kế và lưu lượng trung bình."
         )
     else:
         st.caption(
@@ -362,19 +354,13 @@ with st.container(horizontal=True, horizontal_alignment="left", vertical_alignme
 
 if is_partial_month and data_as_of is not None:
     actual_month = current_actuals.set_index("plant")
-    estimated_month = analog_data[
-        (analog_data["year"] == year) & (analog_data["month"] == month)
-    ].set_index("plant")
     partial_average_rows = []
     for plant in PLANTS:
         partial_average_rows.append(
             {
                 "Nhà máy": plant,
-                f"Sản lượng TB ngày 1–{data_as_of.day}/{month}": (
-                    float(actual_month.at[plant, "production"]) / data_as_of.day
-                ),
-                f"Sản lượng ước cả T{month}": float(
-                    estimated_month.at[plant, "production"]
+                f"Sản lượng lũy kế 1–{data_as_of.day}/{month}": float(
+                    actual_month.at[plant, "production"]
                 ),
                 f"Lưu lượng TB 1–{data_as_of.day}/{month}": float(
                     actual_month.at[plant, "flow"]
@@ -396,7 +382,11 @@ if is_partial_month and data_as_of is not None:
             },
         )
 
-comparison_suffix = " (tháng hiện tại là số ước tính)" if is_partial_month else ""
+comparison_suffix = (
+    f" (T{month} tính đến {data_as_of.day}/{month})"
+    if is_partial_month and data_as_of is not None
+    else ""
+)
 st.subheader(f"So sánh mức tương đồng đến tháng {analog_month}{comparison_suffix}")
 chart_columns = st.columns(3, gap="medium")
 for chart_column, plant in zip(chart_columns, PLANTS):
@@ -501,8 +491,8 @@ if selected:
         )
         if is_partial_month and data_as_of is not None:
             st.caption(
-                f"T{month}/{year}: sản lượng là ước tính từ bình quân ngày 1–{data_as_of.day}; "
-                f"lưu lượng là trung bình đến ngày {data_as_of.day}/{month}."
+                f"T{month} của cả {year} và {analog_year} đều dùng cùng kỳ 01–"
+                f"{data_as_of.day:02d}/{month:02d}: sản lượng lũy kế và lưu lượng trung bình."
             )
         with st.expander("Xem xếp hạng các năm lịch sử"):
             display_ranking = ranking.rename(
