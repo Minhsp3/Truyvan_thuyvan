@@ -387,6 +387,11 @@ comparison_suffix = (
     if is_partial_month and data_as_of is not None
     else ""
 )
+analog_period_label = (
+    f"T1–{data_as_of.day:02d}/{month:02d}"
+    if is_partial_month and data_as_of is not None
+    else f"T1–T{analog_month}"
+)
 st.subheader(f"So sánh mức tương đồng đến tháng {analog_month}{comparison_suffix}")
 chart_columns = st.columns(3, gap="medium")
 for chart_column, plant in zip(chart_columns, PLANTS):
@@ -452,7 +457,7 @@ for chart_column, plant in zip(chart_columns, PLANTS):
         st.altair_chart(similarity_chart)
 st.caption(
     "Chỉ số chuẩn hóa kết hợp sản lượng và lưu lượng; mức 100 tương ứng với bình quân "
-    f"của năm {year} trong giai đoạn T1–T{analog_month}. Hai đường càng gần nhau thì quy luật càng tương đồng."
+    f"của năm {year} trong giai đoạn {analog_period_label}. Hai đường càng gần nhau thì quy luật càng tương đồng."
     + (f" Đoạn nối T{month - 1}–T{month} dùng nét đứt vì T{month} chưa kết thúc." if is_partial_month else "")
 )
 
@@ -462,7 +467,7 @@ if selected:
     ranking = rank_analog_years(analog_data, year, analog_month, plant_filter)
     title = "cả 3 nhà máy" if plant_filter is None else plant_filter
     st.divider()
-    st.subheader(f"Kết quả năm đồng dạng tháng 1–{analog_month} — {title}")
+    st.subheader(f"Kết quả năm đồng dạng {analog_period_label} — {title}")
     if ranking.empty:
         st.warning("Chưa đủ dữ liệu lịch sử từ tháng 1 đến kỳ hiện tại để xác định năm đồng dạng.")
     else:
