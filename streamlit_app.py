@@ -12,12 +12,20 @@ from data_utils import (
     analog_similarity_series,
     annual_projection_table,
     comparison_table,
+    current_month_actuals,
     current_period,
     daily_remaining_production_forecast,
+    latest_complete_actual_date,
+    load_current_hydrology_reports,
     load_daily_folders,
     load_folder,
+    monthly_cumulative_production,
+    prepare_analog_comparison_data,
     rank_analog_years,
+    read_cumulative_hydrology_report,
+    read_daily_production_workbook,
     read_workbook,
+    update_historical_workbooks,
 )
 
 
@@ -38,18 +46,52 @@ def load_daily_data(folder: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     return load_daily_folders(folder)
 
 
+@st.cache_data(ttl="5m", show_spinner="Đang đọc báo cáo thủy văn lũy kế...")
+def load_current_reports(folder: str) -> pd.DataFrame:
+    return load_current_hydrology_reports(folder)
+
+
 @st.cache_data(ttl="5m", show_spinner="Đang đọc tệp đã tải lên...")
-def load_uploaded_data(files: tuple[tuple[str, bytes], ...]) -> pd.DataFrame:
-    frames = [read_workbook(io.BytesIO(content)) for _, content in files]
-    frames = [frame for frame in frames if not frame.empty]
-    if not frames:
-        return pd.DataFrame()
-    data = pd.concat(frames, ignore_index=True)
-    return (
-        data.groupby(["year", "month", "plant"], as_index=False)[["production", "flow"]]
+def load_uploaded_data(
+    files: tuple[tuple[str, bytes], ...]
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    monthly_frames: list[pd.DataFrame] = []
+    production_frames: list[pd.DataFrame] = []
+    report_frames: list[pd.DataFrame] = []
+    for _, content in files:
+        monthly = read_workbook(io.BytesIO(content))
+        daily_production = read_daily_production_workbook(io.BytesIO(content))
+        report = read_cumulative_hydrology_report(io.BytesIO(content))
+        if not monthly.empty:
+            monthly_frames.append(monthly)
+        if not daily_production.empty:
+            production_frames.append(daily_production)
+        if not report.empty:
+            report_frames.append(report)
+
+    monthly_data = (
+        pd.concat(monthly_frames, ignore_index=True)
+        .groupby(["year", "month", "plant"], as_index=False)[["production", "flow"]]
         .mean()
         .sort_values(["year", "month", "plant"])
+        if monthly_frames
+        else pd.DataFrame()
     )
+    daily_data = (
+        pd.concat(production_frames, ignore_index=True)
+        .groupby(["date", "plant"], as_index=False)["production"]
+        .mean()
+        if production_frames
+        else pd.DataFrame(columns=["date", "plant", "production"])
+    )
+    report_data = (
+        pd.concat(report_frames, ignore_index=True)
+        .groupby(["date", "plant"], as_index=False)["flow"]
+        .mean()
+        if report_frames
+        else pd.DataFrame(columns=["date", "plant", "flow"])
+    )
+    return monthly_data, daily_data, report_data
 
 
 def remember_plant() -> None:
@@ -63,23 +105,7 @@ st.caption("Dữ liệu được đọc trực tiếp từ Excel. Đơn vị gi�
 
 local_data, local_files = load_local_data(str(Path.cwd()))
 daily_production, daily_hydrology = load_daily_data(str(Path.cwd()))
-cutoff_path = Path.cwd() / "data_cutoff.txt"
-data_as_of = None
-if not daily_production.empty and not daily_hydrology.empty:
-    complete_production_dates = set(
-        daily_production.groupby("date")["plant"].nunique().loc[lambda values: values >= len(PLANTS)].index
-    )
-    complete_hydrology_dates = set(
-        daily_hydrology.groupby("date")["plant"].nunique().loc[lambda values: values >= len(PLANTS)].index
-    )
-    common_dates = complete_production_dates & complete_hydrology_dates
-    if common_dates:
-        data_as_of = pd.Timestamp(max(common_dates))
-elif cutoff_path.exists():
-    try:
-        data_as_of = pd.Timestamp(cutoff_path.read_text(encoding="utf-8").strip())
-    except (OSError, ValueError):
-        data_as_of = None
+reported_hydrology = load_current_reports(str(Path.cwd()))
 
 with st.sidebar:
     st.header("Nguồn dữ liệu")
@@ -89,17 +115,41 @@ with st.sidebar:
         accept_multiple_files=True,
         help="Ứng dụng tự nhận dạng bảng dài hoặc workbook có mỗi sheet là một năm.",
     )
-    if st.button(":material/refresh: Đọc lại dữ liệu", width="stretch"):
-        st.cache_data.clear()
-        st.rerun()
     if local_files:
         st.success(f"Đã đọc {len(local_files)} tệp trong thư mục.")
         for name in local_files:
             st.caption(name)
 
 uploaded_data = pd.DataFrame()
+uploaded_daily_production = pd.DataFrame(columns=["date", "plant", "production"])
+uploaded_reported_hydrology = pd.DataFrame(columns=["date", "plant", "flow"])
 if uploads:
-    uploaded_data = load_uploaded_data(tuple((file.name, file.getvalue()) for file in uploads))
+    uploaded_data, uploaded_daily_production, uploaded_reported_hydrology = load_uploaded_data(
+        tuple((file.name, file.getvalue()) for file in uploads)
+    )
+
+if not uploaded_daily_production.empty:
+    daily_production = (
+        pd.concat([daily_production, uploaded_daily_production], ignore_index=True)
+        .groupby(["date", "plant"], as_index=False)["production"]
+        .mean()
+    )
+if not uploaded_reported_hydrology.empty:
+    reported_hydrology = (
+        pd.concat([reported_hydrology, uploaded_reported_hydrology], ignore_index=True)
+        .groupby(["date", "plant"], as_index=False)["flow"]
+        .mean()
+    )
+
+data_as_of = latest_complete_actual_date(
+    daily_production, daily_hydrology, reported_hydrology
+)
+cutoff_path = Path.cwd() / "data_cutoff.txt"
+if data_as_of is None and cutoff_path.exists():
+    try:
+        data_as_of = pd.Timestamp(cutoff_path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        data_as_of = None
 
 data = pd.concat([local_data, uploaded_data], ignore_index=True) if not local_data.empty or not uploaded_data.empty else pd.DataFrame()
 if not data.empty:
@@ -109,37 +159,53 @@ if not data.empty:
         .sort_values(["year", "month", "plant"])
     )
 
-if data_as_of is not None and not daily_production.empty and not daily_hydrology.empty:
-    current_daily_production = daily_production[
-        (daily_production["date"].dt.year == data_as_of.year)
-        & (daily_production["date"].dt.month == data_as_of.month)
-        & (daily_production["date"] <= data_as_of)
-    ]
-    current_daily_hydrology = daily_hydrology[
-        (daily_hydrology["date"].dt.year == data_as_of.year)
-        & (daily_hydrology["date"].dt.month == data_as_of.month)
-        & (daily_hydrology["date"] <= data_as_of)
-    ]
-    current_rows = []
-    for plant in PLANTS:
-        plant_production = current_daily_production[
-            current_daily_production["plant"] == plant
-        ]["production"]
-        plant_flow = current_daily_hydrology[current_daily_hydrology["plant"] == plant]["flow"]
-        current_rows.append(
-            {
-                "year": data_as_of.year,
-                "month": data_as_of.month,
-                "plant": plant,
-                "production": plant_production.sum(min_count=1),
-                "flow": plant_flow.mean(),
-            }
+current_actuals = current_month_actuals(
+    daily_production, daily_hydrology, reported_hydrology, data_as_of
+)
+if data_as_of is not None and not current_actuals.empty:
+    if data.empty:
+        data = current_actuals.copy()
+    else:
+        same_period = (data["year"] == data_as_of.year) & (data["month"] == data_as_of.month)
+        data = pd.concat([data.loc[~same_period], current_actuals], ignore_index=True).sort_values(
+            ["year", "month", "plant"]
         )
-    current_actuals = pd.DataFrame(current_rows)
-    same_period = (data["year"] == data_as_of.year) & (data["month"] == data_as_of.month)
-    data = pd.concat([data.loc[~same_period], current_actuals], ignore_index=True).sort_values(
-        ["year", "month", "plant"]
-    )
+
+with st.sidebar:
+    if st.button(":material/refresh: Đọc lại dữ liệu", width="stretch"):
+        st.session_state["refresh_and_sync"] = True
+        st.cache_data.clear()
+        st.rerun()
+
+    if st.session_state.pop("refresh_and_sync", False):
+        try:
+            if data_as_of is None or current_actuals.empty:
+                raise ValueError("Chưa xác định được ngày có đủ dữ liệu của cả 3 nhà máy.")
+            updates, backup_folder = update_historical_workbooks(
+                Path.cwd(), current_actuals, data_as_of.year, data_as_of.month
+            )
+            if updates:
+                st.session_state["refresh_notice"] = (
+                    f"Đã kiểm tra 3 file lịch sử và cập nhật {len(updates)} file có thay đổi "
+                    f"cho T{data_as_of.month}/{data_as_of.year} đến ngày "
+                    f"{data_as_of.strftime('%d/%m/%Y')}. "
+                    f"Bản sao lưu: {backup_folder.name}."
+                )
+            else:
+                st.session_state["refresh_notice"] = (
+                    "Dữ liệu đã mới nhất; không có ô nào cần thay đổi trong 3 file lịch sử."
+                )
+        except Exception as exc:
+            st.session_state["refresh_error"] = f"Không thể cập nhật file lịch sử: {exc}"
+        st.cache_data.clear()
+        st.rerun()
+
+    notice = st.session_state.pop("refresh_notice", None)
+    error = st.session_state.pop("refresh_error", None)
+    if notice:
+        st.success(notice)
+    if error:
+        st.error(error)
 
 if data.empty:
     st.info(
@@ -160,69 +226,181 @@ is_partial_month = bool(
     and data_as_of.day < data_as_of.days_in_month
 )
 analog_month = month - 1 if is_partial_month and month > 1 else month
+analog_data = prepare_analog_comparison_data(data, year, month, data_as_of)
+if is_partial_month:
+    analog_month = month
 if data_as_of is not None and data_as_of.year == year and data_as_of.month == month:
     st.success(f"Dữ liệu thực tế cập nhật đến ngày {data_as_of.strftime('%d/%m/%Y')}.")
+    summary_title = f"Tổng hợp đến ngày {data_as_of.strftime('%d/%m/%Y')}"
+    production_label = f"Sản lượng lũy kế đến {data_as_of.strftime('%d/%m')}"
+    flow_label = f"Lưu lượng TB đến {data_as_of.strftime('%d/%m')}"
 elif not is_calendar_current:
     st.warning(
         f"Excel chưa có dữ liệu cho tháng hiện tại. Trang đang hiển thị kỳ mới nhất tìm thấy: tháng {month}/{year}."
     )
+    summary_title = f"Tổng hợp tháng {month}/{year}"
+    production_label = "Sản lượng tháng hiện tại"
+    flow_label = "Lưu lượng hiện tại"
 else:
     st.success(f"Kỳ dữ liệu hiện tại: tháng {month}/{year}")
+    summary_title = f"Tổng hợp tháng {month}/{year}"
+    production_label = "Sản lượng tháng hiện tại"
+    flow_label = "Lưu lượng hiện tại"
 
 period = data[(data["year"] == year) & (data["month"] == month)].set_index("plant")
+comparison_year: int | None = None
+comparison_production_label: str | None = None
+production_difference_label: str | None = None
+comparison_production = pd.DataFrame()
+comparison_index = pd.DataFrame()
+if data_as_of is not None and data_as_of.year == year and data_as_of.month == month:
+    comparison_year = year - 1
+    comparison_production_label = f"Sản lượng lũy kế cùng kỳ {comparison_year}"
+    production_difference_label = f"Chênh lệch so với {comparison_year} (%)"
+    comparison_production = monthly_cumulative_production(
+        daily_production,
+        comparison_year,
+        month,
+        data_as_of.day,
+    )
+    comparison_index = comparison_production.set_index("plant")
+
 summary_rows: list[dict[str, object]] = []
 best_by_plant: dict[str, int | None] = {}
 for plant in PLANTS:
-    ranked = rank_analog_years(data, year, analog_month, plant)
+    ranked = rank_analog_years(analog_data, year, analog_month, plant)
     analog_year = int(ranked.iloc[0]["year"]) if not ranked.empty else None
     best_by_plant[plant] = analog_year
-    summary_rows.append(
-        {
-            "Nhà máy": plant,
-            "Sản lượng tháng hiện tại": period.at[plant, "production"] if plant in period.index else None,
-            "Lưu lượng hiện tại": period.at[plant, "flow"] if plant in period.index else None,
-            "Năm đồng dạng / Truy vấn": (
-                f":material/search: {analog_year} · Xem" if analog_year else "Chưa đủ dữ liệu"
-            ),
-        }
+    current_production = period.at[plant, "production"] if plant in period.index else None
+    historical_production = (
+        comparison_index.at[plant, "production"]
+        if not comparison_index.empty and plant in comparison_index.index
+        else None
     )
+    production_difference = None
+    if pd.notna(current_production) and pd.notna(historical_production) and historical_production != 0:
+        production_difference = (
+            (float(current_production) - float(historical_production))
+            / abs(float(historical_production))
+            * 100
+        )
+    row: dict[str, object] = {
+        "Nhà máy": plant,
+        production_label: current_production,
+    }
+    if comparison_production_label is not None and production_difference_label is not None:
+        row[comparison_production_label] = historical_production
+        row[production_difference_label] = production_difference
+    row[flow_label] = period.at[plant, "flow"] if plant in period.index else None
+    row["Năm đồng dạng / Truy vấn"] = (
+        f":material/search: {analog_year} · Xem" if analog_year else "Chưa đủ dữ liệu"
+    )
+    summary_rows.append(row)
 
 summary = pd.DataFrame(summary_rows)
-st.subheader(f"Tổng hợp tháng {month}/{year}")
+summary_column_config: dict[str, object] = {
+    "Nhà máy": st.column_config.TextColumn("Nhà máy", pinned=True, width="medium"),
+    production_label: st.column_config.NumberColumn(
+        f"{production_label} (triệu kWh)", format="%.3f", width="medium"
+    ),
+    flow_label: st.column_config.NumberColumn(
+        f"{flow_label} (m³/s)", format="%.3f", width="medium"
+    ),
+    "Năm đồng dạng / Truy vấn": st.column_config.ButtonColumn(
+        "Năm đồng dạng / Truy vấn",
+        type="primary",
+        on_click=remember_plant,
+        key="analog_click",
+        width="medium",
+    ),
+}
+if comparison_production_label is not None and production_difference_label is not None:
+    summary_column_config[comparison_production_label] = st.column_config.NumberColumn(
+        f"{comparison_production_label} (triệu kWh)", format="%.3f", width="medium"
+    )
+    summary_column_config[production_difference_label] = st.column_config.NumberColumn(
+        production_difference_label, format="%+.2f%%", width="medium"
+    )
+st.subheader(summary_title)
 st.dataframe(
     summary,
     hide_index=True,
     row_height=48,
-    column_config={
-        "Nhà máy": st.column_config.TextColumn("Nhà máy", pinned=True, width="medium"),
-        "Sản lượng tháng hiện tại": st.column_config.NumberColumn(
-            "Sản lượng tháng hiện tại (triệu kWh)", format="%.3f", width="medium"
-        ),
-        "Lưu lượng hiện tại": st.column_config.NumberColumn(
-            "Lưu lượng hiện tại (m³/s)", format="%.3f", width="medium"
-        ),
-        "Năm đồng dạng / Truy vấn": st.column_config.ButtonColumn(
-            "Năm đồng dạng / Truy vấn",
-            type="primary",
-            on_click=remember_plant,
-            key="analog_click",
-            width="medium",
-        ),
-    },
+    column_config=summary_column_config,
 )
+
+if comparison_year is not None and data_as_of is not None:
+    st.caption(
+        f"So sánh cùng kỳ dùng tổng sản lượng từ 01–{data_as_of.day:02d}/{month:02d}/{comparison_year}. "
+        f"Chênh lệch = (sản lượng {year} − sản lượng {comparison_year}) / "
+        f"sản lượng {comparison_year} × 100%."
+    )
+    incomplete_plants = comparison_production.loc[
+        comparison_production["days"] < data_as_of.day, "plant"
+    ].tolist()
+    if incomplete_plants:
+        st.warning(
+            f"Dữ liệu cùng kỳ {comparison_year} chưa đủ {data_as_of.day} ngày cho: "
+            + ", ".join(incomplete_plants)
+            + "."
+        )
 
 with st.container(horizontal=True, horizontal_alignment="left", vertical_alignment="center"):
     if st.button(":material/query_stats: Truy vấn cả 3 nhà máy", type="primary"):
         st.session_state["selected_plant"] = "Tất cả"
-    st.caption(
-        f"Năm đồng dạng được xác định từ quy luật sản lượng và lưu lượng tháng 1–{analog_month}; "
-        "năm lịch sử thiếu dữ liệu trong giai đoạn này sẽ không được xếp hạng."
-    )
+    if is_partial_month and data_as_of is not None:
+        st.caption(
+            f"Năm đồng dạng được tính từ T1–T{month}. T{month} dùng sản lượng bình quân "
+            f"ngày 1–{data_as_of.day} quy đổi cho cả tháng và lưu lượng trung bình "
+            f"1–{data_as_of.day}/{month}."
+        )
+    else:
+        st.caption(
+            f"Năm đồng dạng được xác định từ quy luật sản lượng và lưu lượng tháng 1–{analog_month}; "
+            "năm lịch sử thiếu dữ liệu trong giai đoạn này sẽ không được xếp hạng."
+        )
 
-st.subheader(f"So sánh mức tương đồng đến tháng {analog_month}")
+if is_partial_month and data_as_of is not None:
+    actual_month = current_actuals.set_index("plant")
+    estimated_month = analog_data[
+        (analog_data["year"] == year) & (analog_data["month"] == month)
+    ].set_index("plant")
+    partial_average_rows = []
+    for plant in PLANTS:
+        partial_average_rows.append(
+            {
+                "Nhà máy": plant,
+                f"Sản lượng TB ngày 1–{data_as_of.day}/{month}": (
+                    float(actual_month.at[plant, "production"]) / data_as_of.day
+                ),
+                f"Sản lượng ước cả T{month}": float(
+                    estimated_month.at[plant, "production"]
+                ),
+                f"Lưu lượng TB 1–{data_as_of.day}/{month}": float(
+                    actual_month.at[plant, "flow"]
+                ),
+            }
+        )
+    with st.expander(f"Giá trị T{month} dùng để tìm năm đồng dạng"):
+        partial_average_table = pd.DataFrame(partial_average_rows)
+        st.dataframe(
+            partial_average_table,
+            hide_index=True,
+            column_config={
+                "Nhà máy": st.column_config.TextColumn(pinned=True),
+                **{
+                    column: st.column_config.NumberColumn(column, format="%.3f")
+                    for column in partial_average_table.columns
+                    if column != "Nhà máy"
+                },
+            },
+        )
+
+comparison_suffix = " (tháng hiện tại là số ước tính)" if is_partial_month else ""
+st.subheader(f"So sánh mức tương đồng đến tháng {analog_month}{comparison_suffix}")
 chart_columns = st.columns(3, gap="medium")
 for chart_column, plant in zip(chart_columns, PLANTS):
-    ranking = rank_analog_years(data, year, analog_month, plant)
+    ranking = rank_analog_years(analog_data, year, analog_month, plant)
     with chart_column.container(border=True, height="stretch"):
         st.markdown(f"**{plant}**")
         if ranking.empty:
@@ -236,48 +414,62 @@ for chart_column, plant in zip(chart_columns, PLANTS):
             border=False,
         )
         chart_data = analog_similarity_series(
-            data, year, analog_month, plant, analog_year
+            analog_data, year, analog_month, plant, analog_year
         )
-        similarity_chart = (
-            alt.Chart(chart_data)
-            .mark_line(point=True, strokeWidth=2.5)
-            .encode(
-                x=alt.X(
-                    "Tháng:O",
-                    title="Tháng",
-                    axis=alt.Axis(labelAngle=0),
+        chart_encoding = {
+            "x": alt.X("Tháng:O", title="Tháng", axis=alt.Axis(labelAngle=0)),
+            "y": alt.Y(
+                "Chỉ số tương đồng:Q",
+                title="Chỉ số chuẩn hóa",
+                scale=alt.Scale(zero=False),
+            ),
+            "color": alt.Color(
+                "Năm:N",
+                title=None,
+                scale=alt.Scale(
+                    domain=[str(year), str(analog_year)],
+                    range=["#0b78a5", "#e45756"],
                 ),
-                y=alt.Y(
-                    "Chỉ số tương đồng:Q",
-                    title="Chỉ số chuẩn hóa",
-                    scale=alt.Scale(zero=False),
-                ),
-                color=alt.Color(
-                    "Năm:N",
-                    title=None,
-                    scale=alt.Scale(
-                        domain=[str(year), str(analog_year)],
-                        range=["#0b78a5", "#e45756"],
-                    ),
-                ),
-                tooltip=[
-                    alt.Tooltip("Năm:N"),
-                    alt.Tooltip("Tháng:O"),
-                    alt.Tooltip("Chỉ số tương đồng:Q", format=".1f"),
-                ],
+            ),
+        }
+        tooltip = [
+            alt.Tooltip("Năm:N"),
+            alt.Tooltip("Tháng:O"),
+            alt.Tooltip("Chỉ số tương đồng:Q", format=".1f"),
+        ]
+        if is_partial_month:
+            completed = chart_data[chart_data["Tháng"] < month]
+            partial_segment = chart_data[chart_data["Tháng"] >= max(1, month - 1)]
+            solid_line = alt.Chart(completed).mark_line(strokeWidth=2.5).encode(
+                **chart_encoding
             )
-            .properties(height=230)
-        )
+            dashed_line = alt.Chart(partial_segment).mark_line(
+                strokeWidth=2.5, strokeDash=[7, 5]
+            ).encode(**chart_encoding)
+            points = alt.Chart(chart_data).mark_point(filled=True, size=55).encode(
+                **chart_encoding, tooltip=tooltip
+            )
+            similarity_chart = alt.layer(solid_line, dashed_line, points).properties(
+                height=230
+            )
+        else:
+            similarity_chart = (
+                alt.Chart(chart_data)
+                .mark_line(point=True, strokeWidth=2.5)
+                .encode(**chart_encoding, tooltip=tooltip)
+                .properties(height=230)
+            )
         st.altair_chart(similarity_chart)
 st.caption(
     "Chỉ số chuẩn hóa kết hợp sản lượng và lưu lượng; mức 100 tương ứng với bình quân "
     f"của năm {year} trong giai đoạn T1–T{analog_month}. Hai đường càng gần nhau thì quy luật càng tương đồng."
+    + (f" Đoạn nối T{month - 1}–T{month} dùng nét đứt vì T{month} chưa kết thúc." if is_partial_month else "")
 )
 
 selected = st.session_state.get("selected_plant")
 if selected:
     plant_filter = None if selected == "Tất cả" else selected
-    ranking = rank_analog_years(data, year, analog_month, plant_filter)
+    ranking = rank_analog_years(analog_data, year, analog_month, plant_filter)
     title = "cả 3 nhà máy" if plant_filter is None else plant_filter
     st.divider()
     st.subheader(f"Kết quả năm đồng dạng tháng 1–{analog_month} — {title}")
@@ -291,7 +483,9 @@ if selected:
             st.metric("Mức tương đồng", f"{similarity:.1%}", border=True)
             st.metric("Số điểm dữ liệu so sánh", str(int(ranking.iloc[0]["comparisons"])), border=True)
 
-        details = comparison_table(data, year, analog_month, analog_year, plant_filter)
+        details = comparison_table(
+            analog_data, year, analog_month, analog_year, plant_filter
+        )
         detail_columns = {
             column: st.column_config.NumberColumn(column, format="%.3f")
             for column in details.columns
@@ -305,6 +499,11 @@ if selected:
             hide_index=True,
             column_config=detail_columns,
         )
+        if is_partial_month and data_as_of is not None:
+            st.caption(
+                f"T{month}/{year}: sản lượng là ước tính từ bình quân ngày 1–{data_as_of.day}; "
+                f"lưu lượng là trung bình đến ngày {data_as_of.day}/{month}."
+            )
         with st.expander("Xem xếp hạng các năm lịch sử"):
             display_ranking = ranking.rename(
                 columns={
@@ -326,7 +525,9 @@ if selected:
 
 st.divider()
 st.subheader(f"Dự kiến sản lượng còn lại năm {year}")
-projection = annual_projection_table(data, year, month, data_as_of, daily_production)
+projection = annual_projection_table(
+    data, year, month, data_as_of, daily_production, analog_data
+)
 forecast_columns = [f"T{forecast_month}" for forecast_month in range(month + 1, 13)]
 
 if is_partial_month and data_as_of is not None:
@@ -374,7 +575,7 @@ if is_partial_month and data_as_of is not None:
         "từng ngày tương ứng của năm đồng dạng."
     )
     daily_forecast = daily_remaining_production_forecast(
-        data, daily_production, year, month, data_as_of
+        data, daily_production, year, month, data_as_of, analog_data
     )
     if not daily_forecast.empty:
         with st.expander("Xem dự kiến từng ngày còn lại trong tháng"):
@@ -442,6 +643,7 @@ with st.container(horizontal=True, horizontal_alignment="left"):
 if is_partial_month:
     st.info(
         f"Sản lượng và lưu lượng hiện tại được tổng hợp từ dữ liệu ngày đến "
-        f"{data_as_of.strftime('%d/%m/%Y')}. Năm đồng dạng dùng dữ liệu các tháng đầy đủ "
-        f"T1–T{analog_month}; dự kiến phần còn lại của T{month} lấy từng ngày của năm đồng dạng."
+        f"{data_as_of.strftime('%d/%m/%Y')}. Năm đồng dạng dùng dữ liệu T1–T{month}; "
+        f"T{month} được ước từ sản lượng bình quân ngày và lưu lượng trung bình hiện có. "
+        f"Dự kiến phần còn lại của T{month} lấy từng ngày của năm đồng dạng."
     )
