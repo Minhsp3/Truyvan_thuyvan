@@ -911,32 +911,80 @@ def prepare_analog_comparison_data(
     current_year: int,
     cutoff_month: int,
     actual_as_of: pd.Timestamp | None,
+    daily_production: pd.DataFrame | None = None,
+    daily_hydrology: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    """Estimate a partial month's production from its observed daily average.
+    """Use like-for-like month-to-date values when the cutoff month is partial.
 
-    Flow is already a month-to-date mean, so it is kept unchanged. Production
-    is converted from the observed cumulative value to an estimated full-month
-    value: cumulative production / observed days * days in month.
+    The current year keeps its observed cumulative production and mean inflow.
+    For historical years, the cutoff month is rebuilt from daily data through
+    the same calendar day. Years without complete daily production and inflow
+    remain eligible for earlier months but cannot rank through the partial one.
     """
     comparison = df.copy()
     if actual_as_of is None:
         return comparison
-    actual_as_of = pd.Timestamp(actual_as_of)
+    actual_as_of = pd.Timestamp(actual_as_of).normalize()
     if (
         actual_as_of.year != current_year
         or actual_as_of.month != cutoff_month
         or actual_as_of.day >= actual_as_of.days_in_month
     ):
         return comparison
-    current_partial = (comparison["year"] == current_year) & (
+
+    historical_cutoff = (comparison["year"] != current_year) & (
         comparison["month"] == cutoff_month
     )
-    comparison.loc[current_partial, "production"] = (
-        comparison.loc[current_partial, "production"]
-        * actual_as_of.days_in_month
-        / actual_as_of.day
+    comparison = comparison.loc[~historical_cutoff].copy()
+    if (
+        daily_production is None
+        or daily_production.empty
+        or daily_hydrology is None
+        or daily_hydrology.empty
+    ):
+        return comparison
+
+    production_scope = daily_production[
+        (daily_production["date"].dt.year != current_year)
+        & (daily_production["date"].dt.month == cutoff_month)
+        & (daily_production["date"].dt.day <= actual_as_of.day)
+    ].assign(year=lambda frame: frame["date"].dt.year)
+    flow_scope = daily_hydrology[
+        (daily_hydrology["date"].dt.year != current_year)
+        & (daily_hydrology["date"].dt.month == cutoff_month)
+        & (daily_hydrology["date"].dt.day <= actual_as_of.day)
+    ].assign(year=lambda frame: frame["date"].dt.year)
+    production_partial = production_scope.groupby(
+        ["year", "plant"], as_index=False
+    ).agg(
+        production=("production", lambda values: values.sum(min_count=1)),
+        production_days=("date", "nunique"),
     )
-    return comparison
+    flow_partial = flow_scope.groupby(["year", "plant"], as_index=False).agg(
+        flow=("flow", "mean"),
+        flow_days=("date", "nunique"),
+    )
+    historical_partial = production_partial.merge(
+        flow_partial, on=["year", "plant"], how="inner"
+    )
+    historical_partial = historical_partial[
+        (historical_partial["production_days"] >= actual_as_of.day)
+        & (historical_partial["flow_days"] >= actual_as_of.day)
+    ].assign(month=cutoff_month)
+    if historical_partial.empty:
+        return comparison
+
+    return (
+        pd.concat(
+            [
+                comparison,
+                historical_partial[["year", "month", "plant", "production", "flow"]],
+            ],
+            ignore_index=True,
+        )
+        .sort_values(["year", "month", "plant"])
+        .reset_index(drop=True)
+    )
 
 
 def rank_analog_years(
