@@ -1,16 +1,31 @@
 from __future__ import annotations
 
 import io
+import os
+import posixpath
 import re
+import shutil
 import unicodedata
+import uuid
+import zipfile
+from datetime import datetime
 from pathlib import Path
 from typing import BinaryIO, Iterable
+from xml.etree import ElementTree as ET
 
 import numpy as np
 import pandas as pd
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
 
 
 PLANTS = ["Buôn Kuốp", "Buôn Tua Srah", "Srêpốk 3"]
+
+HISTORICAL_WORKBOOKS = {
+    "Buôn Kuốp": "Lưu lượng Sản lượng Buôn Kuop 1977_2026.xlsx",
+    "Buôn Tua Srah": "Lưu lượng Sản lượng Buôn Tua Srah 1977_2026.xlsx",
+    "Srêpốk 3": "Lưu lượng Sản lượng Srepok3 1977_2026.xlsx",
+}
 
 
 def _plain(value: object) -> str:
@@ -411,8 +426,356 @@ def load_daily_folders(folder: str | Path) -> tuple[pd.DataFrame, pd.DataFrame]:
     return production, hydrology
 
 
-def _parse_cumulative_hydrology_report(source: str | Path | BinaryIO) -> pd.DataFrame:
-    """Read current-month mean inflow from column D of the BCTV_LUYKE report."""
+def load_current_hydrology_reports(folder: str | Path) -> pd.DataFrame:
+    """Load dated BCTV_LUYKE summaries placed in the dashboard's root folder."""
+    frames: list[pd.DataFrame] = []
+    for path in sorted(Path(folder).glob("*.xls*")):
+        if path.name.startswith("~$"):
+            continue
+        try:
+            parsed = read_cumulative_hydrology_report(path)
+        except Exception:
+            continue
+        if not parsed.empty:
+            frames.append(parsed)
+    if not frames:
+        return pd.DataFrame(columns=["date", "plant", "flow"])
+    return (
+        pd.concat(frames, ignore_index=True)
+        .groupby(["date", "plant"], as_index=False)["flow"]
+        .mean()
+        .sort_values(["date", "plant"])
+        .reset_index(drop=True)
+    )
+
+
+def latest_complete_actual_date(
+    daily_production: pd.DataFrame,
+    daily_hydrology: pd.DataFrame,
+    reported_hydrology: pd.DataFrame | None = None,
+) -> pd.Timestamp | None:
+    """Return the newest date having production and inflow for all three plants."""
+    if daily_production.empty:
+        return None
+    production_dates = set(
+        daily_production.groupby("date")["plant"]
+        .nunique()
+        .loc[lambda values: values >= len(PLANTS)]
+        .index
+    )
+    hydrology_dates: set[pd.Timestamp] = set()
+    if not daily_hydrology.empty:
+        hydrology_dates.update(
+            daily_hydrology.groupby("date")["plant"]
+            .nunique()
+            .loc[lambda values: values >= len(PLANTS)]
+            .index
+        )
+    if reported_hydrology is not None and not reported_hydrology.empty:
+        hydrology_dates.update(
+            reported_hydrology.groupby("date")["plant"]
+            .nunique()
+            .loc[lambda values: values >= len(PLANTS)]
+            .index
+        )
+    common_dates = production_dates & hydrology_dates
+    return pd.Timestamp(max(common_dates)).normalize() if common_dates else None
+
+
+def current_month_actuals(
+    daily_production: pd.DataFrame,
+    daily_hydrology: pd.DataFrame,
+    reported_hydrology: pd.DataFrame | None,
+    actual_as_of: pd.Timestamp | None,
+) -> pd.DataFrame:
+    """Aggregate production and mean inflow through the selected reporting date."""
+    columns = ["year", "month", "plant", "production", "flow"]
+    if actual_as_of is None or daily_production.empty:
+        return pd.DataFrame(columns=columns)
+    actual_as_of = pd.Timestamp(actual_as_of).normalize()
+    production = daily_production[
+        (daily_production["date"].dt.year == actual_as_of.year)
+        & (daily_production["date"].dt.month == actual_as_of.month)
+        & (daily_production["date"] <= actual_as_of)
+    ]
+
+    report = pd.DataFrame()
+    if reported_hydrology is not None and not reported_hydrology.empty:
+        report = reported_hydrology[reported_hydrology["date"] == actual_as_of]
+    if daily_hydrology.empty:
+        daily_flow = pd.DataFrame(columns=["date", "plant", "flow"])
+    else:
+        daily_flow = daily_hydrology[
+            (daily_hydrology["date"].dt.year == actual_as_of.year)
+            & (daily_hydrology["date"].dt.month == actual_as_of.month)
+            & (daily_hydrology["date"] <= actual_as_of)
+        ]
+
+    rows: list[dict[str, object]] = []
+    for plant in PLANTS:
+        plant_production = production[production["plant"] == plant]["production"]
+        report_flow = (
+            report[report["plant"] == plant]["flow"]
+            if not report.empty
+            else pd.Series(dtype=float)
+        )
+        plant_daily_flow = daily_flow[daily_flow["plant"] == plant]["flow"]
+        flow = report_flow.mean() if not report_flow.empty else plant_daily_flow.mean()
+        rows.append(
+            {
+                "year": actual_as_of.year,
+                "month": actual_as_of.month,
+                "plant": plant,
+                "production": plant_production.sum(min_count=1),
+                "flow": flow,
+            }
+        )
+    return pd.DataFrame(rows, columns=columns)
+
+
+def monthly_cumulative_production(
+    daily_production: pd.DataFrame,
+    year: int,
+    month: int,
+    through_day: int,
+) -> pd.DataFrame:
+    """Sum daily production from the first of a month through a calendar day."""
+    columns = ["plant", "production", "days"]
+    if daily_production.empty:
+        return pd.DataFrame(
+            {"plant": PLANTS, "production": [np.nan] * len(PLANTS), "days": [0] * len(PLANTS)}
+        )[columns]
+
+    last_day = pd.Timestamp(year=year, month=month, day=1).days_in_month
+    cutoff = pd.Timestamp(year=year, month=month, day=min(max(int(through_day), 1), last_day))
+    monthly = daily_production[
+        (daily_production["date"].dt.year == year)
+        & (daily_production["date"].dt.month == month)
+        & (daily_production["date"] <= cutoff)
+    ]
+    totals = (
+        monthly.groupby("plant", as_index=False)
+        .agg(
+            production=("production", lambda values: values.sum(min_count=1)),
+            days=("date", "nunique"),
+        )
+    )
+    return (
+        pd.DataFrame({"plant": PLANTS})
+        .merge(totals, on="plant", how="left")
+        .assign(days=lambda frame: frame["days"].fillna(0).astype(int))
+        [columns]
+    )
+
+
+def _historical_cell_map(worksheet, year: int) -> tuple[int, dict[int, int], dict[int, int]]:
+    for header_row in range(1, min(worksheet.max_row, 10) + 1):
+        month_positions: dict[int, list[int]] = {month: [] for month in range(1, 13)}
+        for column in range(1, worksheet.max_column + 1):
+            number = _number(worksheet.cell(header_row, column).value)
+            if np.isfinite(number) and number.is_integer() and 1 <= number <= 12:
+                month_positions[int(number)].append(column)
+        if not all(len(month_positions[month]) >= 2 for month in range(1, 13)):
+            continue
+        production_columns = {month: month_positions[month][0] for month in range(1, 13)}
+        flow_columns = {month: month_positions[month][1] for month in range(1, 13)}
+        year_column = production_columns[1] - 1
+        for row in range(header_row + 1, worksheet.max_row + 1):
+            cell_year = _number(worksheet.cell(row, year_column).value)
+            if np.isfinite(cell_year) and int(cell_year) == year:
+                return row, production_columns, flow_columns
+    raise ValueError(f"Không tìm thấy dòng năm {year} hoặc hai khối tháng 1–12.")
+
+
+def _set_numeric_cells_in_worksheet(
+    worksheet_xml: bytes, values_by_address: dict[str, float]
+) -> bytes:
+    """Replace selected numeric cells while preserving all other formula caches."""
+    spreadsheet_namespace = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    ET.register_namespace("", spreadsheet_namespace)
+    root = ET.fromstring(worksheet_xml)
+    cells = {
+        cell.attrib.get("r"): cell
+        for cell in root.iter(f"{{{spreadsheet_namespace}}}c")
+        if cell.attrib.get("r") in values_by_address
+    }
+    missing = set(values_by_address) - set(cells)
+    if missing:
+        raise ValueError(f"Không tìm thấy ô cần cập nhật: {', '.join(sorted(missing))}.")
+    for address, value in values_by_address.items():
+        cell = cells[address]
+        cell.set("t", "n")
+        for child_name in ("f", "is"):
+            child = cell.find(f"{{{spreadsheet_namespace}}}{child_name}")
+            if child is not None:
+                cell.remove(child)
+        value_node = cell.find(f"{{{spreadsheet_namespace}}}v")
+        if value_node is None:
+            value_node = ET.SubElement(cell, f"{{{spreadsheet_namespace}}}v")
+        value_node.text = format(float(value), ".15g")
+    return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+
+def _worksheet_archive_path(workbook_archive: zipfile.ZipFile, sheet_name: str) -> str:
+    spreadsheet_namespace = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    office_rel_namespace = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    package_rel_namespace = "http://schemas.openxmlformats.org/package/2006/relationships"
+    workbook_root = ET.fromstring(workbook_archive.read("xl/workbook.xml"))
+    sheet = next(
+        (
+            item
+            for item in workbook_root.iter(f"{{{spreadsheet_namespace}}}sheet")
+            if item.attrib.get("name") == sheet_name
+        ),
+        None,
+    )
+    if sheet is None:
+        raise ValueError(f"Không tìm thấy sheet {sheet_name} trong cấu trúc XLSX.")
+    relationship_id = sheet.attrib.get(f"{{{office_rel_namespace}}}id")
+    relationships_root = ET.fromstring(
+        workbook_archive.read("xl/_rels/workbook.xml.rels")
+    )
+    relationship = next(
+        (
+            item
+            for item in relationships_root.iter(f"{{{package_rel_namespace}}}Relationship")
+            if item.attrib.get("Id") == relationship_id
+        ),
+        None,
+    )
+    if relationship is None or not relationship.attrib.get("Target"):
+        raise ValueError(f"Không xác định được tệp XML của sheet {sheet_name}.")
+    target = relationship.attrib["Target"]
+    return target.lstrip("/") if target.startswith("/") else posixpath.normpath(
+        posixpath.join("xl", target)
+    )
+
+
+def _patch_xlsx_numeric_cells(
+    source: Path,
+    destination: Path,
+    sheet_name: str,
+    values_by_address: dict[str, float],
+) -> None:
+    """Patch selected XLSX cells without recalculating or clearing other formulas."""
+    with zipfile.ZipFile(source, "r") as input_archive:
+        worksheet_path = _worksheet_archive_path(input_archive, sheet_name)
+        patched_worksheet = _set_numeric_cells_in_worksheet(
+            input_archive.read(worksheet_path), values_by_address
+        )
+        with zipfile.ZipFile(destination, "w") as output_archive:
+            for entry in input_archive.infolist():
+                content = patched_worksheet if entry.filename == worksheet_path else input_archive.read(entry)
+                output_archive.writestr(entry, content)
+
+
+def update_historical_workbooks(
+    folder: str | Path,
+    actuals: pd.DataFrame,
+    year: int,
+    month: int,
+) -> tuple[list[dict[str, object]], Path | None]:
+    """Write one month's current actuals to all three historical workbooks safely."""
+    if not 1 <= month <= 12:
+        raise ValueError("Tháng cập nhật phải nằm trong khoảng 1–12.")
+    required = actuals.set_index("plant").reindex(PLANTS)
+    if required[["production", "flow"]].isna().any().any():
+        raise ValueError("Chưa đủ sản lượng và lưu lượng hiện tại của cả 3 nhà máy.")
+
+    prepared: list[dict[str, object]] = []
+    folder = Path(folder)
+    for plant, filename in HISTORICAL_WORKBOOKS.items():
+        path = folder / filename
+        if not path.exists():
+            raise FileNotFoundError(f"Không tìm thấy {filename}.")
+        workbook = load_workbook(path, read_only=True, data_only=False)
+        worksheet = next(
+            (sheet for sheet in workbook.worksheets if canonical_plant(sheet.title) == plant),
+            None,
+        )
+        if worksheet is None:
+            workbook.close()
+            raise ValueError(f"Không tìm thấy sheet của {plant} trong {filename}.")
+        row, production_columns, flow_columns = _historical_cell_map(worksheet, year)
+        production_cell = worksheet.cell(row, production_columns[month])
+        flow_cell = worksheet.cell(row, flow_columns[month])
+        prepared.append(
+            {
+                "plant": plant,
+                "path": path,
+                "sheet_name": worksheet.title,
+                "production_address": f"{get_column_letter(production_columns[month])}{row}",
+                "flow_address": f"{get_column_letter(flow_columns[month])}{row}",
+                "old_production": production_cell.value,
+                "old_flow": flow_cell.value,
+                "production": float(required.at[plant, "production"]),
+                "flow": float(required.at[plant, "flow"]),
+            }
+        )
+        workbook.close()
+
+    changed = [
+        item
+        for item in prepared
+        if not np.isclose(
+            _number(item["old_production"]),
+            item["production"],
+            rtol=1e-12,
+            atol=1e-12,
+            equal_nan=True,
+        )
+        or not np.isclose(
+            _number(item["old_flow"]),
+            item["flow"],
+            rtol=1e-12,
+            atol=1e-12,
+            equal_nan=True,
+        )
+    ]
+    if not changed:
+        return [], None
+
+    backup_folder = folder / "backups" / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    backup_folder.mkdir(parents=True, exist_ok=False)
+    temp_paths: list[tuple[Path, Path]] = []
+    try:
+        for item in prepared:
+            path = item["path"]
+            shutil.copy2(path, backup_folder / path.name)
+        for item in changed:
+            path = item["path"]
+            temporary = path.with_name(f".{path.stem}.{uuid.uuid4().hex}.tmp.xlsx")
+            _patch_xlsx_numeric_cells(
+                path,
+                temporary,
+                item["sheet_name"],
+                {
+                    item["production_address"]: item["production"],
+                    item["flow_address"]: item["flow"],
+                },
+            )
+            temp_paths.append((temporary, path))
+        for temporary, path in temp_paths:
+            os.replace(temporary, path)
+    finally:
+        for temporary, _ in temp_paths:
+            if temporary.exists():
+                temporary.unlink()
+
+    results = [
+        {
+            "Nhà máy": item["plant"],
+            "Sản lượng": item["production"],
+            "Lưu lượng": item["flow"],
+            "Tệp": item["path"].name,
+        }
+        for item in changed
+    ]
+    return results, backup_folder
+
+
+def read_cumulative_hydrology_report(source: str | Path | BinaryIO) -> pd.DataFrame:
+    """Read report date and current-month mean inflow from a BCTV_LUYKE report."""
     excel = pd.ExcelFile(source)
     records: list[dict[str, object]] = []
     for sheet in excel.sheet_names:
@@ -443,13 +806,29 @@ def _parse_cumulative_hydrology_report(source: str | Path | BinaryIO) -> pd.Data
                 if np.isfinite(flow):
                     records.append(
                         {
-                            "year": report_date.year,
-                            "month": report_date.month,
+                            "date": report_date.normalize(),
                             "plant": current_plant,
                             "flow": flow,
                         }
                     )
-    return _combine_metric_rows(pd.DataFrame(records))
+    if not records:
+        return pd.DataFrame(columns=["date", "plant", "flow"])
+    return (
+        pd.DataFrame(records)
+        .groupby(["date", "plant"], as_index=False)["flow"]
+        .mean()
+        .sort_values(["date", "plant"])
+        .reset_index(drop=True)
+    )
+
+
+def _parse_cumulative_hydrology_report(source: str | Path | BinaryIO) -> pd.DataFrame:
+    """Read current-month mean inflow from column D of the BCTV_LUYKE report."""
+    report = read_cumulative_hydrology_report(source)
+    if report.empty:
+        return _combine_metric_rows(pd.DataFrame())
+    monthly = report.assign(year=report["date"].dt.year, month=report["date"].dt.month)
+    return _combine_metric_rows(monthly[["year", "month", "plant", "flow"]])
 
 
 def _combine_metric_rows(df: pd.DataFrame) -> pd.DataFrame:
@@ -525,6 +904,39 @@ def current_period(df: pd.DataFrame, today: pd.Timestamp | None = None) -> tuple
         return today.year, today.month, True
     latest = df[["year", "month"]].drop_duplicates().sort_values(["year", "month"]).iloc[-1]
     return int(latest["year"]), int(latest["month"]), False
+
+
+def prepare_analog_comparison_data(
+    df: pd.DataFrame,
+    current_year: int,
+    cutoff_month: int,
+    actual_as_of: pd.Timestamp | None,
+) -> pd.DataFrame:
+    """Estimate a partial month's production from its observed daily average.
+
+    Flow is already a month-to-date mean, so it is kept unchanged. Production
+    is converted from the observed cumulative value to an estimated full-month
+    value: cumulative production / observed days * days in month.
+    """
+    comparison = df.copy()
+    if actual_as_of is None:
+        return comparison
+    actual_as_of = pd.Timestamp(actual_as_of)
+    if (
+        actual_as_of.year != current_year
+        or actual_as_of.month != cutoff_month
+        or actual_as_of.day >= actual_as_of.days_in_month
+    ):
+        return comparison
+    current_partial = (comparison["year"] == current_year) & (
+        comparison["month"] == cutoff_month
+    )
+    comparison.loc[current_partial, "production"] = (
+        comparison.loc[current_partial, "production"]
+        * actual_as_of.days_in_month
+        / actual_as_of.day
+    )
+    return comparison
 
 
 def rank_analog_years(
@@ -667,6 +1079,7 @@ def annual_projection_table(
     cutoff_month: int,
     actual_as_of: pd.Timestamp | None = None,
     daily_production: pd.DataFrame | None = None,
+    ranking_data: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Combine actual production with analog-year values for the remaining months.
 
@@ -686,11 +1099,22 @@ def annual_projection_table(
     )
     ranking_month = cutoff_month - 1 if is_partial_month and cutoff_month > 1 else cutoff_month
     daily_remainder = daily_remaining_production_forecast(
-        df, daily_production, current_year, cutoff_month, actual_as_of
+        df,
+        daily_production,
+        current_year,
+        cutoff_month,
+        actual_as_of,
+        ranking_data,
     )
+    ranking_source = ranking_data if ranking_data is not None else df
 
     for plant in PLANTS:
-        ranking = rank_analog_years(df, current_year, ranking_month, plant)
+        ranking = rank_analog_years(
+            ranking_source,
+            current_year,
+            cutoff_month if ranking_data is not None else ranking_month,
+            plant,
+        )
         analog_year = int(ranking.iloc[0]["year"]) if not ranking.empty else None
         current = (
             df[(df["year"] == current_year) & (df["plant"] == plant)]
@@ -750,6 +1174,7 @@ def daily_remaining_production_forecast(
     current_year: int,
     cutoff_month: int,
     actual_as_of: pd.Timestamp | None,
+    ranking_data: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Return analog-year production for each remaining day of a partial month."""
     columns = ["Ngày dự kiến", "Nhà máy", "Năm quy luật", "Sản lượng dự kiến"]
@@ -763,10 +1188,15 @@ def daily_remaining_production_forecast(
     ):
         return pd.DataFrame(columns=columns)
 
-    ranking_month = cutoff_month - 1 if cutoff_month > 1 else cutoff_month
+    ranking_source = ranking_data if ranking_data is not None else df
+    ranking_month = (
+        cutoff_month
+        if ranking_data is not None
+        else cutoff_month - 1 if cutoff_month > 1 else cutoff_month
+    )
     rows: list[dict[str, object]] = []
     for plant in PLANTS:
-        ranking = rank_analog_years(df, current_year, ranking_month, plant)
+        ranking = rank_analog_years(ranking_source, current_year, ranking_month, plant)
         if ranking.empty:
             continue
         analog_year = int(ranking.iloc[0]["year"])
