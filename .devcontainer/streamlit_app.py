@@ -29,6 +29,9 @@ from data_utils import (
 )
 
 
+APP_DIR = Path(__file__).resolve().parent.parent
+
+
 st.set_page_config(
     page_title="Truy vấn sản lượng và lưu lượng",
     page_icon=":material/water_drop:",
@@ -103,9 +106,9 @@ def remember_plant() -> None:
 st.title("Sản lượng và lưu lượng tháng hiện tại")
 st.caption("Dữ liệu được đọc trực tiếp từ Excel. Đơn vị giữ nguyên theo nguồn: sản lượng triệu kWh, lưu lượng m³/s.")
 
-local_data, local_files = load_local_data(str(Path.cwd()))
-daily_production, daily_hydrology = load_daily_data(str(Path.cwd()))
-reported_hydrology = load_current_reports(str(Path.cwd()))
+local_data, local_files = load_local_data(str(APP_DIR))
+daily_production, daily_hydrology = load_daily_data(str(APP_DIR))
+reported_hydrology = load_current_reports(str(APP_DIR))
 
 with st.sidebar:
     st.header("Nguồn dữ liệu")
@@ -144,7 +147,7 @@ if not uploaded_reported_hydrology.empty:
 data_as_of = latest_complete_actual_date(
     daily_production, daily_hydrology, reported_hydrology
 )
-cutoff_path = Path.cwd() / "data_cutoff.txt"
+cutoff_path = APP_DIR / "data_cutoff.txt"
 if data_as_of is None and cutoff_path.exists():
     try:
         data_as_of = pd.Timestamp(cutoff_path.read_text(encoding="utf-8").strip())
@@ -182,7 +185,7 @@ with st.sidebar:
             if data_as_of is None or current_actuals.empty:
                 raise ValueError("Chưa xác định được ngày có đủ dữ liệu của cả 3 nhà máy.")
             updates, backup_folder = update_historical_workbooks(
-                Path.cwd(), current_actuals, data_as_of.year, data_as_of.month
+                APP_DIR, current_actuals, data_as_of.year, data_as_of.month
             )
             if updates:
                 st.session_state["refresh_notice"] = (

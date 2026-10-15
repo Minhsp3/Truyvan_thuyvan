@@ -9,7 +9,7 @@ from pathlib import Path
 
 PROJECT_DIR = Path(__file__).resolve().parent
 APP_FILE = PROJECT_DIR / "streamlit_app.py"
-PREFERRED_PORT = int(os.environ.get("DASHBOARD_PORT", "10005"))
+PREFERRED_PORT = int(os.environ.get("DASHBOARD_PORT", "8501"))
 
 
 def get_lan_ip() -> str:

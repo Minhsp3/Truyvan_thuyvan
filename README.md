@@ -2,6 +2,25 @@
 
 Ứng dụng Streamlit hiển thị số liệu tháng hiện tại của ba nhà máy Buôn Kuốp, Buôn Tua Srah và Srêpốk 3, đồng thời tìm năm đồng dạng từ dữ liệu lịch sử.
 
+## Chạy từ GitHub
+
+GitHub lưu trữ mã nguồn; để mở dashboard trên Internet, triển khai repository này bằng
+[Streamlit Community Cloud](https://share.streamlit.io/):
+
+1. Đẩy mã nguồn và dữ liệu lên nhánh `main` của repository.
+2. Trong Streamlit Community Cloud, chọn **Create app** và kết nối repository GitHub.
+3. Chọn nhánh `main`, đặt **Main file path** là `streamlit_app.py`, rồi bấm **Deploy**.
+
+Nền tảng tự cài các thư viện trong `requirements.txt` và tự cấp cổng chạy. Không chạy
+`run_dashboard.py` trên Community Cloud vì tệp đó chỉ dành cho máy Windows/LAN.
+
+Repository cũng hỗ trợ GitHub Codespaces. Khi mở Codespace, môi trường tự cài thư viện,
+chạy `streamlit_app.py` trên cổng 8501 và mở cổng này trong phần **Ports**.
+
+> Lưu ý: hệ thống tệp của Community Cloud chỉ là tạm thời. Muốn cập nhật dữ liệu lâu dài,
+> hãy thay các file Excel trong repository rồi commit/push lên GitHub. File tải lên từ giao
+> diện và thay đổi tạo ra khi ứng dụng đang chạy sẽ mất khi ứng dụng khởi động lại.
+
 ## Chạy ứng dụng
 
 Khởi động theo giao diện terminal có địa chỉ Local và LAN:
@@ -12,7 +31,7 @@ Khởi động theo giao diện terminal có địa chỉ Local và LAN:
 
 Hoặc nhấp đúp `run_dashboard.bat`.
 
-Dashboard ưu tiên chạy tại `http://127.0.0.1:10005`. Nếu cổng này đang được dùng,
+Dashboard ưu tiên chạy tại `http://127.0.0.1:8501`. Nếu cổng này đang được dùng,
 trình khởi động tự chọn cổng trống kế tiếp. Máy khác trong cùng mạng nội bộ dùng
 địa chỉ `LAN access` được in trên terminal.
 
