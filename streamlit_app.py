@@ -464,6 +464,138 @@ st.caption(
     + (f" Đoạn nối T{month - 1}–T{month} dùng nét đứt vì T{month} chưa kết thúc." if is_partial_month else "")
 )
 
+with st.popover(
+    "Giải thích cách tính",
+    icon=":material/help:",
+    help="Xem công thức độ tương đồng và điểm chuẩn hóa trên đồ thị.",
+):
+    st.markdown("#### 1. Mức tương đồng (%)")
+    st.markdown(
+        "Với từng năm lịch sử, ứng dụng tính sai lệch tuyệt đối bình quân của "
+        "**sản lượng** và **lưu lượng**, rồi chuẩn hóa theo giá trị bình quân của "
+        f"năm {year} trong giai đoạn {analog_period_label}."
+    )
+    st.latex(
+        r"E_{SL}=\frac{TB\left(\left|SL_{LS,t}-SL_{HT,t}\right|\right)}"
+        r"{TB\left(\left|SL_{HT,t}\right|\right)}"
+    )
+    st.latex(
+        r"E_Q=\frac{TB\left(\left|Q_{LS,t}-Q_{HT,t}\right|\right)}"
+        r"{TB\left(\left|Q_{HT,t}\right|\right)}"
+    )
+    st.latex(r"Tuong\ dong=\max\left(0,1-\frac{E_{SL}+E_Q}{2}\right)\times100\%")
+    st.markdown(
+        "Năm có sai lệch bình quân nhỏ nhất được chọn là **năm đồng dạng nhất**. "
+        "Nếu tháng hiện tại chưa kết thúc, hai năm được so sánh cùng số ngày của tháng đó."
+    )
+
+    st.divider()
+    st.markdown("#### 2. Điểm chuẩn hóa trên đồ thị")
+    st.markdown(
+        "Sản lượng và lưu lượng có đơn vị khác nhau nên được đưa về cùng thang điểm. "
+        f"Mẫu số luôn là bình quân của năm {year}, nhờ vậy hai năm được vẽ trên cùng một chuẩn."
+    )
+    st.latex(
+        r"I_{y,t}=\frac{1}{2}\left("
+        r"\frac{SL_{y,t}}{TB(SL_{HT})}\times100+"
+        r"\frac{Q_{y,t}}{TB(Q_{HT})}\times100\right)"
+    )
+    st.info(
+        "Điểm chuẩn hóa là mức tổng hợp dùng để vẽ đường, không phải phần trăm tương đồng. "
+        "Khoảng cách giữa hai điểm cũng là điểm chuẩn hóa, không phải phần trăm sai lệch.",
+        icon=":material/info:",
+    )
+
+    example_plant = "Buôn Tua Srah"
+    example_ranking = rank_analog_years(
+        analog_data, year, analog_month, example_plant
+    )
+    example_month = min(9, analog_month)
+    if not example_ranking.empty:
+        example_year = int(example_ranking.iloc[0]["year"])
+        example_scope = analog_data[
+            (analog_data["plant"] == example_plant)
+            & (analog_data["year"].isin([year, example_year]))
+            & (analog_data["month"].between(1, analog_month))
+        ]
+        current_scope = example_scope[example_scope["year"] == year]
+        example_rows = example_scope[example_scope["month"] == example_month]
+        if (
+            len(example_rows) == 2
+            and current_scope["production"].notna().any()
+            and current_scope["flow"].notna().any()
+        ):
+            production_scale = max(
+                float(current_scope["production"].abs().mean()), 1e-9
+            )
+            flow_scale = max(float(current_scope["flow"].abs().mean()), 1e-9)
+            example_values = []
+            for comparison_year in (year, example_year):
+                source_row = example_rows[
+                    example_rows["year"] == comparison_year
+                ].iloc[0]
+                production_index = (
+                    float(source_row["production"]) / production_scale * 100
+                )
+                flow_index = float(source_row["flow"]) / flow_scale * 100
+                example_values.append(
+                    {
+                        "Năm": comparison_year,
+                        "Sản lượng": float(source_row["production"]),
+                        "Lưu lượng": float(source_row["flow"]),
+                        "Điểm SL": production_index,
+                        "Điểm lưu lượng": flow_index,
+                        "Điểm tổng hợp": (production_index + flow_index) / 2,
+                    }
+                )
+
+            example_table = pd.DataFrame(example_values)
+            current_example = example_table[example_table["Năm"] == year].iloc[0]
+            historical_example = example_table[
+                example_table["Năm"] == example_year
+            ].iloc[0]
+            production_error = abs(
+                float(historical_example["Sản lượng"])
+                - float(current_example["Sản lượng"])
+            ) / max(abs(float(current_example["Sản lượng"])), 1e-9)
+            flow_error = abs(
+                float(historical_example["Lưu lượng"])
+                - float(current_example["Lưu lượng"])
+            ) / max(abs(float(current_example["Lưu lượng"])), 1e-9)
+            monthly_similarity = max(
+                0.0, 1.0 - (production_error + flow_error) / 2
+            )
+            point_distance = abs(
+                float(current_example["Điểm tổng hợp"])
+                - float(historical_example["Điểm tổng hợp"])
+            )
+
+            st.markdown(
+                f"#### Ví dụ: {example_plant}, tháng {example_month} "
+                f"({year} so với {example_year})"
+            )
+            st.caption(
+                f"Giá trị chuẩn: sản lượng bình quân {year} = {production_scale:.3f}; "
+                f"lưu lượng bình quân {year} = {flow_scale:.3f}."
+            )
+            st.dataframe(
+                example_table,
+                hide_index=True,
+                column_config={
+                    "Năm": st.column_config.NumberColumn(format="%d"),
+                    **{
+                        column: st.column_config.NumberColumn(format="%.3f")
+                        for column in example_table.columns
+                        if column != "Năm"
+                    },
+                },
+            )
+            st.markdown(
+                f"Khoảng cách hai điểm chuẩn hóa: **{point_distance:.2f} điểm**. "
+                f"Mức tương đồng nếu chỉ xét riêng tháng {example_month}: "
+                f"**{monthly_similarity:.2%}**."
+            )
+
 selected = st.session_state.get("selected_plant")
 if selected:
     plant_filter = None if selected == "Tất cả" else selected
