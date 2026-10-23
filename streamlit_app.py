@@ -396,6 +396,29 @@ analog_period_label = (
     else f"T1–T{analog_month}"
 )
 st.subheader(f"So sánh mức tương đồng đến tháng {analog_month}{comparison_suffix}")
+chart_year_ranking = rank_analog_years(analog_data, year, analog_month)
+chart_year_auto_label = "Tự động – năm đồng dạng nhất"
+chart_year_options = [chart_year_auto_label]
+if not chart_year_ranking.empty:
+    chart_year_options.extend(
+        str(candidate_year)
+        for candidate_year in sorted(
+            chart_year_ranking["year"].astype(int).tolist(), reverse=True
+        )
+    )
+chart_year_choice = st.selectbox(
+    "Chọn năm lịch sử để vẽ trên biểu đồ",
+    chart_year_options,
+    key="chart_comparison_year",
+    help=(
+        "Chọn một năm để cả ba biểu đồ cùng so sánh với năm hiện tại. "
+        "Chế độ tự động chọn năm có sai lệch nhỏ nhất riêng cho từng nhà máy."
+    ),
+    width=360,
+)
+selected_chart_year = (
+    None if chart_year_choice == chart_year_auto_label else int(chart_year_choice)
+)
 chart_columns = st.columns(3, gap="medium")
 for chart_column, plant in zip(chart_columns, PLANTS):
     ranking = rank_analog_years(analog_data, year, analog_month, plant)
@@ -404,8 +427,16 @@ for chart_column, plant in zip(chart_columns, PLANTS):
         if ranking.empty:
             st.info("Chưa đủ dữ liệu để so sánh.")
             continue
-        analog_year = int(ranking.iloc[0]["year"])
-        similarity = float(ranking.iloc[0]["similarity"])
+        selected_ranking = (
+            ranking.iloc[[0]]
+            if selected_chart_year is None
+            else ranking[ranking["year"] == selected_chart_year]
+        )
+        if selected_ranking.empty:
+            st.info(f"Năm {selected_chart_year} chưa đủ dữ liệu để so sánh.")
+            continue
+        analog_year = int(selected_ranking.iloc[0]["year"])
+        similarity = float(selected_ranking.iloc[0]["similarity"])
         st.metric(
             f"{year} so với {analog_year}",
             f"{similarity:.1%}",
@@ -512,7 +543,11 @@ with st.popover(
     )
     example_month = min(9, analog_month)
     if not example_ranking.empty:
-        example_year = int(example_ranking.iloc[0]["year"])
+        example_year = (
+            int(example_ranking.iloc[0]["year"])
+            if selected_chart_year is None
+            else selected_chart_year
+        )
         example_scope = analog_data[
             (analog_data["plant"] == example_plant)
             & (analog_data["year"].isin([year, example_year]))
