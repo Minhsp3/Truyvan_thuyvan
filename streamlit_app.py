@@ -397,6 +397,26 @@ analog_period_label = (
 )
 st.subheader(f"So sánh mức tương đồng đến tháng {analog_month}{comparison_suffix}")
 chart_year_ranking = rank_analog_years(analog_data, year, analog_month)
+full_year_candidates = []
+for candidate_year in chart_year_ranking["year"].astype(int).tolist():
+    candidate_scope = analog_data[
+        (analog_data["year"] == candidate_year)
+        & (analog_data["month"].between(1, 12))
+    ]
+    has_full_year = all(
+        candidate_scope[
+            (candidate_scope["plant"] == plant)
+            & candidate_scope[metric].notna()
+        ]["month"].nunique()
+        == 12
+        for plant in PLANTS
+        for metric in ("production", "flow")
+    )
+    if has_full_year:
+        full_year_candidates.append(candidate_year)
+chart_year_ranking = chart_year_ranking[
+    chart_year_ranking["year"].isin(full_year_candidates)
+]
 chart_year_auto_label = "Tự động – năm đồng dạng nhất"
 chart_year_options = [chart_year_auto_label]
 if not chart_year_ranking.empty:
@@ -422,6 +442,7 @@ selected_chart_year = (
 chart_columns = st.columns(3, gap="medium")
 for chart_column, plant in zip(chart_columns, PLANTS):
     ranking = rank_analog_years(analog_data, year, analog_month, plant)
+    ranking = ranking[ranking["year"].isin(full_year_candidates)]
     with chart_column.container(border=True, height="stretch"):
         st.markdown(f"**{plant}**")
         if ranking.empty:
@@ -443,10 +464,15 @@ for chart_column, plant in zip(chart_columns, PLANTS):
             border=False,
         )
         chart_data = analog_similarity_series(
-            analog_data, year, analog_month, plant, analog_year
+            analog_data, year, 12, plant, analog_year
         )
         chart_encoding = {
-            "x": alt.X("Tháng:O", title="Tháng", axis=alt.Axis(labelAngle=0)),
+            "x": alt.X(
+                "Tháng:O",
+                title="Tháng",
+                sort=list(range(1, 13)),
+                axis=alt.Axis(labelAngle=0, values=list(range(1, 13))),
+            ),
             "y": alt.Y(
                 "Chỉ số tương đồng:Q",
                 title="Chỉ số chuẩn hóa",
@@ -467,12 +493,23 @@ for chart_column, plant in zip(chart_columns, PLANTS):
             alt.Tooltip("Chỉ số tương đồng:Q", format=".1f"),
         ]
         if is_partial_month:
-            completed = chart_data[chart_data["Tháng"] < month]
-            partial_segment = chart_data[chart_data["Tháng"] >= max(1, month - 1)]
-            solid_line = alt.Chart(completed).mark_line(strokeWidth=2.5).encode(
+            current_chart_data = chart_data[chart_data["Năm"] == str(year)]
+            historical_chart_data = chart_data[
+                chart_data["Năm"] == str(analog_year)
+            ]
+            completed_current = current_chart_data[
+                current_chart_data["Tháng"] < month
+            ]
+            partial_current = current_chart_data[
+                current_chart_data["Tháng"].between(max(1, month - 1), month)
+            ]
+            solid_data = pd.concat(
+                [historical_chart_data, completed_current], ignore_index=True
+            )
+            solid_line = alt.Chart(solid_data).mark_line(strokeWidth=2.5).encode(
                 **chart_encoding
             )
-            dashed_line = alt.Chart(partial_segment).mark_line(
+            dashed_line = alt.Chart(partial_current).mark_line(
                 strokeWidth=2.5, strokeDash=[7, 5]
             ).encode(**chart_encoding)
             points = alt.Chart(chart_data).mark_point(filled=True, size=55).encode(
@@ -492,7 +529,8 @@ for chart_column, plant in zip(chart_columns, PLANTS):
 st.caption(
     "Chỉ số chuẩn hóa kết hợp sản lượng và lưu lượng; mức 100 tương ứng với bình quân "
     f"của năm {year} trong giai đoạn {analog_period_label}. Hai đường càng gần nhau thì quy luật càng tương đồng."
-    + (f" Đoạn nối T{month - 1}–T{month} dùng nét đứt vì T{month} chưa kết thúc." if is_partial_month else "")
+    + " Năm lịch sử được hiển thị đủ T1–T12; các tháng sau kỳ hiện tại chỉ để tham khảo và không tham gia tính tương đồng."
+    + (f" Đường năm {year} từ T{month - 1}–T{month} dùng nét đứt vì T{month} chưa kết thúc." if is_partial_month else "")
 )
 
 with st.popover(
@@ -541,6 +579,9 @@ with st.popover(
     example_ranking = rank_analog_years(
         analog_data, year, analog_month, example_plant
     )
+    example_ranking = example_ranking[
+        example_ranking["year"].isin(full_year_candidates)
+    ]
     example_month = min(9, analog_month)
     if not example_ranking.empty:
         example_year = (
